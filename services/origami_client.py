@@ -126,6 +126,10 @@ class OrigamiClient:
             raise OrigamiAPIError(f"Network error: {e}") from e
         return self._handle(r)
 
+    def get_sequence(self, sequence_id: str) -> dict:
+        """Fetch one sequence detail. Callers typically want the `campaignId` field."""
+        return self._get(f"/sequences/{sequence_id}")
+
     def get_campaign(self, campaign_id: str) -> OrigamiCampaign:
         """Fetch a single campaign; useful for discovering workspace_id or basic metadata."""
         payload = self._get(f"/campaigns/{campaign_id}")

@@ -6,3 +6,6 @@ __pycache__/
 .env.local
 .pytest_cache/
 .DS_Store
+data/
+*.sqlite
+*.sqlite-journal

@@ -16,21 +16,20 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
+from .event_store import StoredReply, list_recent_replies, open_store
 from .origami_client import (
     OrigamiAPIError,
     OrigamiCampaign,
     OrigamiClient,
-    OrigamiPerson,
 )
 
 logger = logging.getLogger(__name__)
 
-# Origami's list endpoint doesn't give reply timestamps — addedAt is a proxy for
-# "how recent." Widened so late-cycle replies still surface.
 DEFAULT_LOOKBACK_HOURS = int(os.getenv("REVIEWER_LOOKBACK_HOURS", "36"))
 
 
@@ -88,71 +87,89 @@ class DigestData:
 # ---------------------------------------------------------------------------
 
 
-def _within_lookback(added_at: Optional[str], hours: int) -> bool:
-    """Origami stamps addedAt as ISO 8601 UTC. Missing timestamps err on the side of including."""
-    if not added_at:
-        return True
-    try:
-        cleaned = added_at.rstrip("Z")
-        ts = datetime.fromisoformat(cleaned).replace(tzinfo=timezone.utc)
-    except ValueError:
-        return True
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    return ts >= cutoff
-
-
-def collect_origami(
-    client: OrigamiClient,
-    lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
-) -> tuple[list[Reply], list[ActivePerson]]:
-    """Walk every discovered campaign; return (recent replies, still-active roster)."""
-    replies: list[Reply] = []
+def collect_origami_active(client: OrigamiClient) -> list[ActivePerson]:
+    """Walk active/paused campaigns; return the still-in-sequence roster."""
     active: list[ActivePerson] = []
-
     try:
         campaigns = client.discover_campaigns()
     except OrigamiAPIError as e:
         logger.error("Origami campaign discovery failed: %s", e)
-        return replies, active
+        return active
 
     for c in campaigns:
-        # If workspace enumeration returned a status field, skip inactive/draft; when
-        # we hydrated from campaign IDs, get_campaign returns status too.
         if c.status and c.status not in ("active", "paused"):
             continue
         try:
-            people = list(client.iter_people(c.id, statuses=["sent", "replied"]))
+            for p in client.iter_people(c.id, statuses=["sent"]):
+                if p.send_status == "sent" and not p.stop_reason:
+                    active.append(
+                        ActivePerson(
+                            platform="origami",
+                            recipient=(p.recipient or "").strip().lower(),
+                            campaign_name=c.name,
+                            campaign_id=c.id,
+                            sequence_id=p.sequence_id,
+                        )
+                    )
         except OrigamiAPIError as e:
             logger.warning("Origami people fetch failed for %s: %s", c.name or c.id, e)
             continue
-
-        for p in people:
-            if p.send_status == "replied":
-                if _within_lookback(p.added_at, lookback_hours):
-                    replies.append(_reply_from_origami(p, c))
-            elif p.send_status == "sent" and not p.stop_reason:
-                active.append(
-                    ActivePerson(
-                        platform="origami",
-                        recipient=(p.recipient or "").strip().lower(),
-                        campaign_name=c.name,
-                        campaign_id=c.id,
-                        sequence_id=p.sequence_id,
-                    )
-                )
-    return replies, active
+    return active
 
 
-def _reply_from_origami(p: OrigamiPerson, c: OrigamiCampaign) -> Reply:
-    channel = p.channels[0] if p.channels else ""
+def collect_origami_replies(
+    store: sqlite3.Connection,
+    client: Optional[OrigamiClient],
+    lookback_hours: int,
+    campaigns_by_id: Optional[dict[str, OrigamiCampaign]] = None,
+) -> list[Reply]:
+    """
+    Read reply events landed by the webhook receiver within the lookback window,
+    then resolve each row's sequence_id → campaign name (cached per-run).
+    """
+    stored = list_recent_replies(store, lookback_hours)
+    if not stored:
+        return []
+
+    campaign_name_cache: dict[str, str] = {}
+    campaigns_by_id = campaigns_by_id or {}
+
+    def _campaign_name_for(sequence_id: str) -> str:
+        if sequence_id in campaign_name_cache:
+            return campaign_name_cache[sequence_id]
+        campaign_id = ""
+        if client is not None:
+            try:
+                seq = client.get_sequence(sequence_id)
+                campaign_id = seq.get("campaignId") or ""
+            except OrigamiAPIError as e:
+                logger.warning("Sequence %s lookup failed: %s", sequence_id, e)
+        name = campaigns_by_id.get(campaign_id).name if campaign_id in campaigns_by_id else ""
+        if not name and campaign_id and client is not None:
+            try:
+                name = client.get_campaign(campaign_id).name or ""
+            except OrigamiAPIError:
+                name = ""
+        campaign_name_cache[sequence_id] = name
+        return name
+
+    replies: list[Reply] = []
+    for s in stored:
+        replies.append(_reply_from_stored(s, _campaign_name_for(s.sequence_id)))
+    return replies
+
+
+def _reply_from_stored(s: StoredReply, campaign_name: str) -> Reply:
     return Reply(
         platform="origami",
-        recipient=(p.recipient or "").strip().lower(),
-        campaign_name=c.name,
-        campaign_id=c.id,
-        channel=channel,
-        replied_at=p.added_at,
-        sequence_id=p.sequence_id,
+        recipient=s.recipient,
+        campaign_name=campaign_name,
+        campaign_id="",
+        channel=s.channel,
+        subject=s.subject or "",
+        snippet=s.snippet or "",
+        replied_at=s.received_at,
+        sequence_id=s.sequence_id,
     )
 
 
@@ -345,7 +362,13 @@ def run_reviewer(
             origami_client = None
 
     if origami_client is not None:
-        origami_replies, origami_active = collect_origami(origami_client, lookback_hours)
+        origami_active = collect_origami_active(origami_client)
+
+    store = open_store()
+    try:
+        origami_replies = collect_origami_replies(store, origami_client, lookback_hours)
+    finally:
+        store.close()
 
     plusvibe_replies, plusvibe_active, plusvibe_connected = collect_plusvibe(lookback_hours)
 

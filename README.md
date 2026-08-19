@@ -13,13 +13,20 @@ No automated terminations. No interactive buttons.
 ## Architecture
 
 ```
+Origami reply happens ────► POST /webhooks/origami (HMAC-signed)
+                              │
+                              ▼
+                       SQLite event store (${DATA_DIR}/reviewer.sqlite)
+                              ▲
+                              │
 Origami scheduled agent (5pm ET, daily)
    │
    ▼
-POST https://<railway-url>/reviewer/run?secret=<REVIEWER_SHARED_SECRET>
+POST /reviewer/run?secret=<REVIEWER_SHARED_SECRET>
    │
    ▼
-collect_origami() ── walks each campaign, gathers replies + still-active roster
+collect_origami_active() ── walks campaigns for still-in-sequence roster
+collect_origami_replies() ── reads reply events from SQLite within lookback
 collect_plusvibe() ── stub until a Plusvibe read source is wired
 compute_reconciliations() ── cross-joins replies vs. still-active by email
 build_digest() ── Slack Block Kit
@@ -28,15 +35,21 @@ build_digest() ── Slack Block Kit
 POST SLACK_WEBHOOK_URL → digest lands in Slack
 ```
 
+Replies are captured in real time via webhook so the digest sees the actual
+`received_at` timestamp — a polled fallback based on `addedAt` misses everyone
+added to a campaign more than the lookback window ago.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `app.py` | FastAPI app: `POST /reviewer/run`, `GET /health`. |
-| `services/origami_client.py` | Origami v2 REST client — `discover_campaigns()`, `iter_people()`, `stop_sequence()`. |
+| `app.py` | FastAPI app: `POST /reviewer/run`, `POST /webhooks/origami`, `GET /health`. |
+| `services/origami_client.py` | Origami v2 REST client — `discover_campaigns()`, `iter_people()`, `get_sequence()`, `stop_sequence()`. |
+| `services/origami_webhook.py` | HMAC-SHA256 signature verifier (Standard Webhooks spec). |
+| `services/event_store.py` | SQLite wrapper for reply events — `insert_reply_event()`, `list_recent_replies()`. |
 | `services/sequence_reviewer.py` | Collectors, reconciliation join, pure `build_digest()`, `run_reviewer()`. |
 | `services/slack_notifier.py` | `post_digest(blocks)` → `SLACK_WEBHOOK_URL`. |
-| `tests/test_sequence_reviewer.py` | Unit tests for the join + digest shape. |
+| `tests/` | Signature verify, event store, join + digest shape. |
 
 ## Configuration
 
@@ -50,6 +63,8 @@ Copy `.env.example` → `.env` and fill in:
 | `SLACK_WEBHOOK_URL` | ✓ | Incoming webhook for the reviewer channel. |
 | `REVIEWER_SHARED_SECRET` | recommended | Gates `/reviewer/run`. Generate: `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. |
 | `REVIEWER_LOOKBACK_HOURS` | optional | Default 36. |
+| `ORIGAMI_WEBHOOK_SECRET` | ✓ | `whsec_...` from Origami's dashboard reveal modal (see "Webhook setup" below). Without it, `POST /webhooks/origami` returns 500. |
+| `DATA_DIR` | ✓ (Railway) | Filesystem path for the reply-event SQLite DB. `./data` locally; `/data` on Railway with a mounted volume. |
 
 ## Local dev
 
@@ -74,11 +89,30 @@ and a digest lands in Slack.
 
 1. Push this repo to GitHub.
 2. In Railway → **New Project → Deploy from GitHub**, pick the repo.
-3. **Variables** tab: paste every var from `.env.example`.
-4. Railway detects the Dockerfile and deploys. Note the public URL.
-5. In Origami, create a scheduled agent (daily 5pm ET) whose only instruction
+3. **Variables** tab: paste every var from `.env.example` (set `DATA_DIR=/data`).
+4. **Settings → Volumes** → attach a new volume, mount at `/data` (5 GB free tier
+   is plenty — the DB is a few KB per reply).
+5. Railway detects the Dockerfile and deploys. Note the public URL.
+6. Follow **Webhook setup** below to point Origami at the deployed
+   `/webhooks/origami` endpoint.
+7. In Origami, create a scheduled agent (daily 5pm ET) whose only instruction
    is: `POST <railway-url>/reviewer/run?secret=<REVIEWER_SHARED_SECRET>`.
-6. Trigger it once from Origami's dashboard to smoke-test.
+8. Trigger it once from Origami's dashboard to smoke-test.
+
+## Webhook setup (Origami → `/webhooks/origami`)
+
+1. Origami dashboard → **Settings → Developers → Webhooks → New endpoint**.
+2. **URL** = `https://<railway-url>/webhooks/origami`.
+3. **Event types** — subscribe to at least `sequence.reply.received`. (The
+   receiver also accepts `webhook.test` for the dashboard's test button.)
+4. Save. A reveal modal shows the `whsec_...` secret **once** — copy it and
+   paste into Railway as `ORIGAMI_WEBHOOK_SECRET`. Redeploy.
+5. Back in the dashboard, click **Test endpoint**. The delivery log should go
+   green and Railway logs should show `[origami-webhook] test event received`.
+6. From this moment forward, every reply Origami sees is captured in the
+   SQLite store and picked up by the next daily digest.
+
+Historical replies received before this point are not backfilled.
 
 ## Plusvibe (open dependency)
 
