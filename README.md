@@ -45,8 +45,9 @@ Copy `.env.example` → `.env` and fill in:
 | Var | Required | Notes |
 |-----|----------|-------|
 | `ORIGAMI_API_KEY` | ✓ | `og_live_...` bearer token. |
-| `ORIGAMI_CAMPAIGN_IDS` | ✓ (if no workspace) | Comma-separated campaign IDs. New campaigns must be added manually. |
-| `ORIGAMI_WORKSPACE_ID` | optional | If present, replaces the manual list — enumerates every campaign in the workspace. |
+| `ORIGAMI_WORKSPACE_ID` | one of these three | Fastest — enumerates every campaign in the workspace with zero extra calls. |
+| `ORIGAMI_BOOTSTRAP_CAMPAIGN_ID` | one of these three | **Recommended.** Any single campaign ID; the client fetches it once, reads `workspaceId` off the response, then enumerates the whole workspace. New campaigns auto-included. |
+| `ORIGAMI_CAMPAIGN_IDS` | one of these three | Fallback — comma-separated. Manual (new campaigns require env update). |
 | `SLACK_WEBHOOK_URL` | ✓ | Incoming webhook for the reviewer channel. |
 | `REVIEWER_SHARED_SECRET` | recommended | Gates `/reviewer/run`. Generate: `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. |
 | `REVIEWER_LOOKBACK_HOURS` | optional | Default 36. |

@@ -1,5 +1,8 @@
 """Unit tests for the Sequence Reviewer digest builder + cross-reference logic."""
 
+from unittest.mock import patch
+
+from services.origami_client import OrigamiCampaign, OrigamiClient
 from services.sequence_reviewer import (
     ActivePerson,
     DigestData,
@@ -186,6 +189,61 @@ class TestBuildDigest:
         for b in blocks:
             assert "type" in b
             assert b["type"] in {"header", "section", "divider", "context"}
+
+
+class TestDiscoverCampaigns:
+    def test_workspace_id_short_circuits(self):
+        client = OrigamiClient(api_key="test", workspace_id="ws-1")
+        with patch.object(client, "list_workspace_campaigns") as list_ws, \
+             patch.object(client, "get_campaign") as get_c:
+            list_ws.return_value = [_campaign("c1")]
+            result = client.discover_campaigns()
+            list_ws.assert_called_once()
+            get_c.assert_not_called()
+            assert [c.id for c in result] == ["c1"]
+
+    def test_bootstrap_discovers_workspace_then_lists(self):
+        client = OrigamiClient(api_key="test", bootstrap_campaign_id="boot-99")
+        with patch.object(client, "get_campaign") as get_c, \
+             patch.object(client, "list_workspace_campaigns") as list_ws:
+            get_c.return_value = _campaign("boot-99", workspace_id="ws-42")
+            list_ws.return_value = [_campaign("c1"), _campaign("c2")]
+            result = client.discover_campaigns()
+            get_c.assert_called_once_with("boot-99")
+            list_ws.assert_called_once()
+            assert client.workspace_id == "ws-42"  # cached for future calls
+            assert {c.id for c in result} == {"c1", "c2"}
+
+    def test_manual_campaign_ids_fallback(self):
+        client = OrigamiClient(api_key="test", campaign_ids=["a", "b"])
+        with patch.object(client, "get_campaign") as get_c:
+            get_c.side_effect = [_campaign("a"), _campaign("b")]
+            result = client.discover_campaigns()
+            assert [c.id for c in result] == ["a", "b"]
+            assert get_c.call_count == 2
+
+    def test_no_config_raises(self):
+        from services.origami_client import OrigamiAPIError
+
+        client = OrigamiClient(api_key="test")
+        # ensure no env leakage into fallback
+        client.campaign_ids = []
+        try:
+            client.discover_campaigns()
+        except OrigamiAPIError as e:
+            assert "No campaigns to review" in str(e)
+        else:
+            raise AssertionError("expected OrigamiAPIError")
+
+
+def _campaign(cid: str, workspace_id=None) -> OrigamiCampaign:
+    return OrigamiCampaign(
+        id=cid,
+        slug=cid,
+        name=f"Campaign {cid}",
+        status="active",
+        workspace_id=workspace_id,
+    )
 
 
 def _flatten_blocks(blocks):

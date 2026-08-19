@@ -72,6 +72,7 @@ class OrigamiClient:
         api_key: Optional[str] = None,
         workspace_id: Optional[str] = None,
         campaign_ids: Optional[list[str]] = None,
+        bootstrap_campaign_id: Optional[str] = None,
         timeout: int = 30,
     ):
         self.api_key = api_key or os.getenv("ORIGAMI_API_KEY")
@@ -80,6 +81,9 @@ class OrigamiClient:
                 "Set ORIGAMI_API_KEY or pass api_key."
             )
         self.workspace_id = workspace_id or os.getenv("ORIGAMI_WORKSPACE_ID") or None
+        self.bootstrap_campaign_id = (
+            bootstrap_campaign_id or os.getenv("ORIGAMI_BOOTSTRAP_CAMPAIGN_ID") or None
+        )
         env_campaigns = os.getenv("ORIGAMI_CAMPAIGN_IDS", "")
         self.campaign_ids = campaign_ids or [c.strip() for c in env_campaigns.split(",") if c.strip()]
         self.timeout = timeout
@@ -163,16 +167,38 @@ class OrigamiClient:
         Return the campaigns the reviewer should scan.
 
         Priority:
-          1. If ORIGAMI_WORKSPACE_ID is set → enumerate every campaign in that workspace.
-          2. Else fall back to ORIGAMI_CAMPAIGN_IDS → hydrate each one via /campaigns/:id.
+          1. ORIGAMI_WORKSPACE_ID set → enumerate every campaign in that workspace.
+          2. ORIGAMI_BOOTSTRAP_CAMPAIGN_ID set → fetch that one campaign, learn its
+             workspaceId from the response, then enumerate every campaign in the
+             workspace. Discovered workspace_id is cached on the instance so
+             subsequent calls skip the extra GET.
+          3. ORIGAMI_CAMPAIGN_IDS set → hydrate each listed campaign via /campaigns/:id.
+             (Manual, does not auto-pick up new campaigns.)
 
-        Callers get a uniform list either way.
+        Callers get a uniform OrigamiCampaign list either way.
         """
         if self.workspace_id:
             return self.list_workspace_campaigns()
+
+        if self.bootstrap_campaign_id:
+            bootstrap = self.get_campaign(self.bootstrap_campaign_id)
+            if bootstrap.workspace_id:
+                self.workspace_id = bootstrap.workspace_id  # cache for future calls
+                logger.info(
+                    "Discovered workspace_id=%s from bootstrap campaign %s",
+                    bootstrap.workspace_id,
+                    self.bootstrap_campaign_id,
+                )
+                return self.list_workspace_campaigns()
+            logger.warning(
+                "Bootstrap campaign %s did not carry workspaceId; falling back to manual list.",
+                self.bootstrap_campaign_id,
+            )
+
         if not self.campaign_ids:
             raise OrigamiAPIError(
-                "No campaigns to review: set either ORIGAMI_WORKSPACE_ID or ORIGAMI_CAMPAIGN_IDS."
+                "No campaigns to review: set ORIGAMI_WORKSPACE_ID, "
+                "ORIGAMI_BOOTSTRAP_CAMPAIGN_ID, or ORIGAMI_CAMPAIGN_IDS."
             )
         campaigns: list[OrigamiCampaign] = []
         for cid in self.campaign_ids:
