@@ -72,7 +72,6 @@ class OrigamiClient:
         api_key: Optional[str] = None,
         workspace_id: Optional[str] = None,
         campaign_ids: Optional[list[str]] = None,
-        bootstrap_campaign_id: Optional[str] = None,
         timeout: int = 30,
     ):
         self.api_key = api_key or os.getenv("ORIGAMI_API_KEY")
@@ -81,9 +80,6 @@ class OrigamiClient:
                 "Set ORIGAMI_API_KEY or pass api_key."
             )
         self.workspace_id = workspace_id or os.getenv("ORIGAMI_WORKSPACE_ID") or None
-        self.bootstrap_campaign_id = (
-            bootstrap_campaign_id or os.getenv("ORIGAMI_BOOTSTRAP_CAMPAIGN_ID") or None
-        )
         env_campaigns = os.getenv("ORIGAMI_CAMPAIGN_IDS", "")
         self.campaign_ids = campaign_ids or [c.strip() for c in env_campaigns.split(",") if c.strip()]
         self.timeout = timeout
@@ -142,6 +138,11 @@ class OrigamiClient:
             workspace_id=payload.get("workspaceId"),
         )
 
+    def list_workspaces(self) -> list[str]:
+        """List every workspace visible to the API key. Returns workspace IDs (single page — Origami's contract)."""
+        payload = self._get("/workspaces")
+        return [item["id"] for item in payload.get("items", []) if item.get("id")]
+
     def list_workspace_campaigns(self, workspace_id: Optional[str] = None) -> list[OrigamiCampaign]:
         """List campaigns in a workspace. Origami returns a single page (nextCursor is null)."""
         ws = workspace_id or self.workspace_id
@@ -167,46 +168,33 @@ class OrigamiClient:
         Return the campaigns the reviewer should scan.
 
         Priority:
-          1. ORIGAMI_WORKSPACE_ID set → enumerate every campaign in that workspace.
-          2. ORIGAMI_BOOTSTRAP_CAMPAIGN_ID set → fetch that one campaign, learn its
-             workspaceId from the response, then enumerate every campaign in the
-             workspace. Discovered workspace_id is cached on the instance so
-             subsequent calls skip the extra GET.
-          3. ORIGAMI_CAMPAIGN_IDS set → hydrate each listed campaign via /campaigns/:id.
-             (Manual, does not auto-pick up new campaigns.)
-
-        Callers get a uniform OrigamiCampaign list either way.
+          1. ORIGAMI_WORKSPACE_ID set → enumerate that single workspace only.
+          2. ORIGAMI_CAMPAIGN_IDS set → hydrate each listed campaign via /campaigns/:id.
+             (Manual pin, does not auto-pick up new campaigns.)
+          3. Default → GET /workspaces, then enumerate campaigns in every workspace.
+             New workspaces and new campaigns are picked up automatically.
         """
         if self.workspace_id:
             return self.list_workspace_campaigns()
 
-        if self.bootstrap_campaign_id:
-            bootstrap = self.get_campaign(self.bootstrap_campaign_id)
-            if bootstrap.workspace_id:
-                self.workspace_id = bootstrap.workspace_id  # cache for future calls
-                logger.info(
-                    "Discovered workspace_id=%s from bootstrap campaign %s",
-                    bootstrap.workspace_id,
-                    self.bootstrap_campaign_id,
-                )
-                return self.list_workspace_campaigns()
-            logger.warning(
-                "Bootstrap campaign %s did not carry workspaceId; falling back to manual list.",
-                self.bootstrap_campaign_id,
-            )
+        if self.campaign_ids:
+            campaigns: list[OrigamiCampaign] = []
+            for cid in self.campaign_ids:
+                try:
+                    campaigns.append(self.get_campaign(cid))
+                except OrigamiAPIError as e:
+                    logger.warning("Skipping campaign %s: %s", cid, e)
+            return campaigns
 
-        if not self.campaign_ids:
-            raise OrigamiAPIError(
-                "No campaigns to review: set ORIGAMI_WORKSPACE_ID, "
-                "ORIGAMI_BOOTSTRAP_CAMPAIGN_ID, or ORIGAMI_CAMPAIGN_IDS."
-            )
-        campaigns: list[OrigamiCampaign] = []
-        for cid in self.campaign_ids:
+        workspace_ids = self.list_workspaces()
+        logger.info("Enumerating campaigns across %d workspaces", len(workspace_ids))
+        aggregated: list[OrigamiCampaign] = []
+        for ws in workspace_ids:
             try:
-                campaigns.append(self.get_campaign(cid))
+                aggregated.extend(self.list_workspace_campaigns(ws))
             except OrigamiAPIError as e:
-                logger.warning("Skipping campaign %s: %s", cid, e)
-        return campaigns
+                logger.warning("Skipping workspace %s: %s", ws, e)
+        return aggregated
 
     def iter_people(
         self,

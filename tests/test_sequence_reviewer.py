@@ -195,45 +195,53 @@ class TestDiscoverCampaigns:
     def test_workspace_id_short_circuits(self):
         client = OrigamiClient(api_key="test", workspace_id="ws-1")
         with patch.object(client, "list_workspace_campaigns") as list_ws, \
-             patch.object(client, "get_campaign") as get_c:
+             patch.object(client, "list_workspaces") as list_all:
             list_ws.return_value = [_campaign("c1")]
             result = client.discover_campaigns()
             list_ws.assert_called_once()
-            get_c.assert_not_called()
+            list_all.assert_not_called()
             assert [c.id for c in result] == ["c1"]
 
-    def test_bootstrap_discovers_workspace_then_lists(self):
-        client = OrigamiClient(api_key="test", bootstrap_campaign_id="boot-99")
-        with patch.object(client, "get_campaign") as get_c, \
-             patch.object(client, "list_workspace_campaigns") as list_ws:
-            get_c.return_value = _campaign("boot-99", workspace_id="ws-42")
-            list_ws.return_value = [_campaign("c1"), _campaign("c2")]
-            result = client.discover_campaigns()
-            get_c.assert_called_once_with("boot-99")
-            list_ws.assert_called_once()
-            assert client.workspace_id == "ws-42"  # cached for future calls
-            assert {c.id for c in result} == {"c1", "c2"}
-
-    def test_manual_campaign_ids_fallback(self):
+    def test_manual_campaign_ids_short_circuit(self):
         client = OrigamiClient(api_key="test", campaign_ids=["a", "b"])
-        with patch.object(client, "get_campaign") as get_c:
+        with patch.object(client, "get_campaign") as get_c, \
+             patch.object(client, "list_workspaces") as list_all:
             get_c.side_effect = [_campaign("a"), _campaign("b")]
             result = client.discover_campaigns()
             assert [c.id for c in result] == ["a", "b"]
             assert get_c.call_count == 2
+            list_all.assert_not_called()
 
-    def test_no_config_raises(self):
+    def test_default_enumerates_all_workspaces(self):
+        client = OrigamiClient(api_key="test")
+        client.campaign_ids = []  # ensure no env leakage
+        with patch.object(client, "list_workspaces") as list_all, \
+             patch.object(client, "list_workspace_campaigns") as list_ws:
+            list_all.return_value = ["ws-1", "ws-2"]
+            list_ws.side_effect = [
+                [_campaign("c1", workspace_id="ws-1")],
+                [_campaign("c2", workspace_id="ws-2"), _campaign("c3", workspace_id="ws-2")],
+            ]
+            result = client.discover_campaigns()
+            list_all.assert_called_once()
+            assert list_ws.call_count == 2
+            assert [c.id for c in result] == ["c1", "c2", "c3"]
+
+    def test_default_skips_failing_workspaces(self):
         from services.origami_client import OrigamiAPIError
 
         client = OrigamiClient(api_key="test")
-        # ensure no env leakage into fallback
         client.campaign_ids = []
-        try:
-            client.discover_campaigns()
-        except OrigamiAPIError as e:
-            assert "No campaigns to review" in str(e)
-        else:
-            raise AssertionError("expected OrigamiAPIError")
+        with patch.object(client, "list_workspaces") as list_all, \
+             patch.object(client, "list_workspace_campaigns") as list_ws:
+            list_all.return_value = ["ws-1", "ws-broken", "ws-2"]
+            list_ws.side_effect = [
+                [_campaign("c1")],
+                OrigamiAPIError("boom"),
+                [_campaign("c2")],
+            ]
+            result = client.discover_campaigns()
+            assert [c.id for c in result] == ["c1", "c2"]
 
 
 def _campaign(cid: str, workspace_id=None) -> OrigamiCampaign:

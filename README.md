@@ -44,10 +44,9 @@ Copy `.env.example` → `.env` and fill in:
 
 | Var | Required | Notes |
 |-----|----------|-------|
-| `ORIGAMI_API_KEY` | ✓ | `og_live_...` bearer token. |
-| `ORIGAMI_WORKSPACE_ID` | one of these three | Fastest — enumerates every campaign in the workspace with zero extra calls. |
-| `ORIGAMI_BOOTSTRAP_CAMPAIGN_ID` | one of these three | **Recommended.** Any single campaign ID; the client fetches it once, reads `workspaceId` off the response, then enumerates the whole workspace. New campaigns auto-included. |
-| `ORIGAMI_CAMPAIGN_IDS` | one of these three | Fallback — comma-separated. Manual (new campaigns require env update). |
+| `ORIGAMI_API_KEY` | ✓ | `og_live_...` bearer token. Alone, this is enough — the reviewer will `GET /workspaces`, enumerate every workspace, then every campaign in each. New workspaces + campaigns auto-included. |
+| `ORIGAMI_WORKSPACE_ID` | optional | Narrows the reviewer to one workspace. |
+| `ORIGAMI_CAMPAIGN_IDS` | optional | Comma-separated. Manual pin — new campaigns must be added here by hand. |
 | `SLACK_WEBHOOK_URL` | ✓ | Incoming webhook for the reviewer channel. |
 | `REVIEWER_SHARED_SECRET` | recommended | Gates `/reviewer/run`. Generate: `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. |
 | `REVIEWER_LOOKBACK_HOURS` | optional | Default 36. |
@@ -90,16 +89,13 @@ headless service. When a read source is resolved (direct REST route,
 mailbox-forwarding to a Gmail Railway can poll, etc.), populate
 `collect_plusvibe()` — the digest and reconciliation code are already generic.
 
-## Recovering the Origami workspace ID
-
-If you want to switch off the manual campaign list, any single campaign detail
-call carries `workspaceId`:
+## Listing your workspaces (for reference)
 
 ```bash
 curl -H "Authorization: Bearer $ORIGAMI_API_KEY" \
-  https://origami.chat/api/v2/campaigns/<any-campaign-id> | jq .workspaceId
+  https://origami.chat/api/v2/workspaces | jq '.items[] | {id, name}'
 ```
 
-Set the returned value as `ORIGAMI_WORKSPACE_ID` and remove
-`ORIGAMI_CAMPAIGN_IDS`; the client prefers workspace enumeration when both are
-set.
+You don't need to pick one — leave `ORIGAMI_WORKSPACE_ID` empty and the reviewer
+scans them all. Set it only if you want to narrow the review to a single
+workspace.
