@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from services.event_store import insert_reply_event, open_store
 from services.origami_webhook import verify_origami_webhook
+from services.plusvibe_slack_webhook import verify_slack_signature
 from services.sequence_reviewer import run_reviewer
 from services.slack_notifier import post_digest, SlackNotifierError
 
@@ -153,6 +154,69 @@ async def origami_webhook(request: Request):
     else:
         logger.info("[origami-webhook] duplicate reply, ignored (id=%s)", webhook_id)
     return {"ok": True, "type": event_type, "stored": inserted}
+
+
+@app.post("/webhooks/plusvibe")
+async def plusvibe_webhook(request: Request):
+    """
+    Receive Slack Events API callbacks from a channel Plusvibe posts replies into.
+
+    Two request shapes:
+      1. url_verification (one-time handshake when the Slack app is created) —
+         respond with the `challenge` value, no signature check.
+      2. event_callback — verify Slack signing secret, log the event payload for
+         parser development. Once the payload shape is known, parse and persist.
+    """
+    raw = await request.body()
+
+    import json as _json
+
+    try:
+        payload = _json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        logger.warning("Plusvibe webhook body not JSON: %s", e)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="body is not JSON")
+
+    if payload.get("type") == "url_verification":
+        challenge = payload.get("challenge", "")
+        logger.info("[plusvibe-webhook] url_verification handshake")
+        return {"challenge": challenge}
+
+    signing_secret = os.getenv("PLUSVIBE_SLACK_SIGNING_SECRET")
+    if not signing_secret:
+        logger.error("PLUSVIBE_SLACK_SIGNING_SECRET not set; refusing event")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="slack signing secret not configured",
+        )
+
+    timestamp = request.headers.get("x-slack-request-timestamp", "")
+    signature = request.headers.get("x-slack-signature", "")
+    if not verify_slack_signature(
+        raw_body=raw,
+        timestamp=timestamp,
+        signature=signature,
+        signing_secret=signing_secret,
+    ):
+        logger.warning("[plusvibe-webhook] signature invalid")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid signature")
+
+    event = payload.get("event") or {}
+    logger.info(
+        "[plusvibe-webhook] event type=%s subtype=%s ts=%s bot_id=%s text=%r",
+        event.get("type"),
+        event.get("subtype"),
+        event.get("ts"),
+        event.get("bot_id"),
+        (event.get("text") or "")[:500],
+    )
+    if event.get("attachments"):
+        logger.info("[plusvibe-webhook] attachments=%s", _json.dumps(event["attachments"])[:2000])
+    if event.get("blocks"):
+        logger.info("[plusvibe-webhook] blocks=%s", _json.dumps(event["blocks"])[:2000])
+
+    # Parser + persistence land in the next commit once we know the message shape.
+    return {"ok": True, "logged": True}
 
 
 def _sections(data) -> dict:
