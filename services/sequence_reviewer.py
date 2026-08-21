@@ -21,7 +21,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
-from .event_store import StoredReply, list_recent_replies, open_store
+from .event_store import (
+    StoredPlusvibeReply,
+    StoredReply,
+    list_recent_plusvibe_replies,
+    list_recent_replies,
+    open_store,
+)
 from .origami_client import (
     OrigamiAPIError,
     OrigamiCampaign,
@@ -173,17 +179,26 @@ def _reply_from_stored(s: StoredReply, campaign_name: str) -> Reply:
     )
 
 
-def collect_plusvibe(lookback_hours: int = DEFAULT_LOOKBACK_HOURS) -> tuple[list[Reply], list[ActivePerson], bool]:
-    """
-    Placeholder collector for Plusvibe.
+def collect_plusvibe_replies(
+    store: sqlite3.Connection, lookback_hours: int
+) -> list[Reply]:
+    """Read Plusvibe reply events (persisted from Slack notifications) within lookback."""
+    stored = list_recent_plusvibe_replies(store, lookback_hours)
+    return [_reply_from_plusvibe(s) for s in stored]
 
-    The Plusvibe REST API does not currently expose a replies-with-labels endpoint
-    that's reachable from a headless service, and MCP isn't reachable from a Railway
-    process. Returns empty + connected=False so the digest can render an honest
-    banner. When a read source lands, populate this function — the digest and
-    reconciliation code are already generic.
-    """
-    return [], [], False
+
+def _reply_from_plusvibe(s: StoredPlusvibeReply) -> Reply:
+    return Reply(
+        platform="plusvibe",
+        recipient=s.recipient,
+        campaign_name=s.campaign_name,
+        campaign_id="",
+        channel="email",
+        subject=(s.label or ""),  # label surfaced as subject-ish in the digest
+        snippet="",  # notification carries no body
+        replied_at=s.received_at,
+        is_ooo=s.is_ooo,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,10 +382,12 @@ def run_reviewer(
     store = open_store()
     try:
         origami_replies = collect_origami_replies(store, origami_client, lookback_hours)
+        plusvibe_replies = collect_plusvibe_replies(store, lookback_hours)
     finally:
         store.close()
 
-    plusvibe_replies, plusvibe_active, plusvibe_connected = collect_plusvibe(lookback_hours)
+    plusvibe_active: list[ActivePerson] = []  # no Plusvibe active-roster source yet
+    plusvibe_connected = True  # Slack channel is the source of truth
 
     reconciliations = compute_reconciliations(
         origami_replies, plusvibe_replies, origami_active, plusvibe_active

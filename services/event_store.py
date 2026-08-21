@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS origami_reply_events (
   inserted_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_reply_received_at ON origami_reply_events(received_at DESC);
+
+CREATE TABLE IF NOT EXISTS plusvibe_reply_events (
+  slack_ts TEXT PRIMARY KEY,
+  received_at TEXT NOT NULL,
+  campaign_name TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  label TEXT,
+  is_ooo INTEGER NOT NULL DEFAULT 0,
+  workspace TEXT,
+  webhook_name TEXT,
+  inserted_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_plusvibe_received_at ON plusvibe_reply_events(received_at DESC);
 """
 
 
@@ -54,6 +67,16 @@ class StoredReply:
     subject: Optional[str]
     snippet: Optional[str]
     newly_stopped: bool
+
+
+@dataclass
+class StoredPlusvibeReply:
+    slack_ts: str
+    received_at: str
+    campaign_name: str
+    recipient: str
+    label: Optional[str]
+    is_ooo: bool
 
 
 def _resolve_db_path(data_dir: Optional[str] = None) -> Path:
@@ -151,6 +174,58 @@ def list_recent_replies(conn: sqlite3.Connection, hours: int) -> list[StoredRepl
             subject=r["subject"],
             snippet=r["snippet"],
             newly_stopped=bool(r["newly_stopped"]),
+        )
+        for r in rows
+    ]
+
+
+def insert_plusvibe_reply(conn: sqlite3.Connection, parsed: dict) -> bool:
+    """Insert one parsed Plusvibe reply. Returns False if slack_ts already existed."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO plusvibe_reply_events (
+                slack_ts, received_at, campaign_name, recipient,
+                label, is_ooo, workspace, webhook_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                parsed["slack_ts"],
+                parsed["received_at"],
+                parsed["campaign_name"],
+                parsed["recipient"],
+                parsed.get("label"),
+                1 if parsed.get("is_ooo") else 0,
+                parsed.get("workspace"),
+                parsed.get("webhook_name"),
+            ),
+        )
+    except sqlite3.IntegrityError:
+        return False
+    conn.execute(
+        "DELETE FROM plusvibe_reply_events WHERE received_at < datetime('now', ?)",
+        (f"-{RETENTION_DAYS} days",),
+    )
+    return True
+
+
+def list_recent_plusvibe_replies(conn: sqlite3.Connection, hours: int) -> list[StoredPlusvibeReply]:
+    rows = conn.execute(
+        """
+        SELECT * FROM plusvibe_reply_events
+        WHERE received_at >= datetime('now', ?)
+        ORDER BY received_at DESC
+        """,
+        (f"-{hours} hours",),
+    ).fetchall()
+    return [
+        StoredPlusvibeReply(
+            slack_ts=r["slack_ts"],
+            received_at=r["received_at"],
+            campaign_name=r["campaign_name"],
+            recipient=r["recipient"],
+            label=r["label"],
+            is_ooo=bool(r["is_ooo"]),
         )
         for r in rows
     ]

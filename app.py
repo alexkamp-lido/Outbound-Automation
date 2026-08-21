@@ -18,8 +18,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from services.event_store import insert_reply_event, open_store
+from services.event_store import insert_plusvibe_reply, insert_reply_event, open_store
 from services.origami_webhook import verify_origami_webhook
+from services.plusvibe_backfill import backfill as backfill_plusvibe
+from services.plusvibe_parser import parse_plusvibe_message
 from services.plusvibe_slack_webhook import verify_slack_signature
 from services.sequence_reviewer import run_reviewer
 from services.slack_notifier import post_digest, SlackNotifierError
@@ -197,6 +199,24 @@ async def plusvibe_webhook(request: Request):
                 logger.warning("[plusvibe-webhook] slack signature invalid")
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid signature")
 
+        if payload.get("type") == "event_callback":
+            event = payload.get("event") or {}
+            if event.get("type") == "message":
+                parsed = parse_plusvibe_message(event)
+                if parsed is None:
+                    logger.info("[plusvibe-webhook] message ignored (not a Plusvibe reply)")
+                    return {"ok": True, "stored": False}
+                conn = open_store()
+                try:
+                    stored = insert_plusvibe_reply(conn, parsed)
+                finally:
+                    conn.close()
+                logger.info(
+                    "[plusvibe-webhook] stored=%s recipient=%s campaign=%r label=%s",
+                    stored, parsed["recipient"], parsed["campaign_name"], parsed.get("label"),
+                )
+                return {"ok": True, "stored": stored}
+
         logger.info("[plusvibe-webhook] json payload received: %s", _json.dumps(payload)[:2000])
         return {"ok": True}
 
@@ -216,6 +236,36 @@ async def plusvibe_webhook(request: Request):
         (payload.get("text") or "")[:2000],
     )
     return {}
+
+
+@app.post("/backfill/plusvibe")
+async def plusvibe_backfill_endpoint(request: Request):
+    """
+    Pull Plusvibe reply notifications from Slack channel history and store them.
+
+    Same auth gate as /reviewer/run (REVIEWER_SHARED_SECRET). Uses env vars
+    SLACK_USER_TOKEN (or SLACK_BOT_TOKEN) and PLUSVIBE_SLACK_CHANNEL_ID.
+    """
+    expected = os.getenv("REVIEWER_SHARED_SECRET")
+    if expected:
+        if request.query_params.get("secret", "") != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing secret")
+
+    token = os.getenv("SLACK_USER_TOKEN") or os.getenv("SLACK_BOT_TOKEN")
+    channel_id = os.getenv("PLUSVIBE_SLACK_CHANNEL_ID")
+    if not token or not channel_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="SLACK_USER_TOKEN/SLACK_BOT_TOKEN and PLUSVIBE_SLACK_CHANNEL_ID must be set",
+        )
+
+    try:
+        hours = int(request.query_params.get("hours", "24"))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hours must be int")
+
+    raw, parsed_count, inserted = backfill_plusvibe(token=token, channel_id=channel_id, hours=hours)
+    return {"ok": True, "hours": hours, "raw_messages": raw, "parsed": parsed_count, "inserted": inserted}
 
 
 def _sections(data) -> dict:
