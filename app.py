@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Sequence Reviewer", version="0.1.0")
+app = FastAPI(title="Sequence Reviewer", version="0.1.1-plusvibe")
 
 
 @app.get("/health")
