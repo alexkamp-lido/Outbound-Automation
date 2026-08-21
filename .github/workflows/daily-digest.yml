@@ -1,0 +1,30 @@
+name: Daily Sequence Reviewer Digest
+
+on:
+  schedule:
+    # 21:00 UTC daily.
+    # → 5:00 pm ET during EDT (Mar–Nov)
+    # → 4:00 pm ET during EST (Nov–Mar).
+    # Adjust to '0 22 * * *' if you want strict 5pm ET year-round in winter.
+    - cron: '0 21 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  post-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger /reviewer/run
+        env:
+          REVIEWER_URL: ${{ secrets.REVIEWER_URL }}
+          SECRET: ${{ secrets.REVIEWER_SHARED_SECRET }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "${REVIEWER_URL}/reviewer/run?secret=${SECRET}")
+          echo "$resp"
+          code=$(echo "$resp" | awk -F: '/^HTTP_STATUS:/{print $2}')
+          if [ "$code" != "200" ]; then
+            echo "::error::Reviewer returned HTTP $code"
+            exit 1
+          fi
